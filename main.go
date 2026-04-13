@@ -48,7 +48,8 @@ func main() {
 		}
 
 		context := args[0]
-		
+
+		// parse name:tag
 		parts := strings.Split(*tag, ":")
 		if len(parts) != 2 {
 			fmt.Println("invalid tag format, expected name:tag")
@@ -57,36 +58,61 @@ func main() {
 
 		name := parts[0]
 		tagVal := parts[1]
-		
-		// create minimal manifest (dummy build for now)
+
+		fmt.Println("Building", name+":"+tagVal, "context:", context, "no-cache:", *noCache)
+
+		// 1. Parse Docksmithfile
+		instructions, err := parseDocksmithfile("Docksmithfile")
+		if err != nil {
+			fmt.Println("parse error:", err)
+			os.Exit(1)
+		}
+
+		// 2. Execute instructions (this handles COPY layers now)
+		buildState, err := executeInstructions(instructions, context, state)
+		if err != nil {
+			fmt.Println("build error:", err)
+			os.Exit(1)
+		}
+
+		// debug (optional)
+		fmt.Println("Final Build State:")
+		fmt.Println("Base:", buildState.BaseImage)
+		fmt.Println("Workdir:", buildState.WorkingDir)
+		fmt.Println("Env:", buildState.Env)
+		fmt.Println("Cmd:", buildState.Cmd)
+		fmt.Println("Layers:", len(buildState.Layers))
+
+		// 3. Create manifest from build state
 		m := ImageManifest{
 			Name:    name,
 			Tag:     tagVal,
-			Digest:  "", // will compute later
+			Digest:  "",
 			Created: time.Now().Format(time.RFC3339),
 			Config: Config{
-				Env:        []string{},
-				Cmd:        []string{},
-				WorkingDir: "",
+				Env:        buildState.Env,
+				Cmd:        buildState.Cmd,
+				WorkingDir: buildState.WorkingDir,
 			},
-			Layers: []Layer{},
+			Layers: buildState.Layers,
 		}
+
+		// 4. Compute digest
 		digest, err := computeManifestDigest(&m)
 		if err != nil {
 			fmt.Println("error computing digest:", err)
 			os.Exit(1)
 		}
-
 		m.Digest = digest
-		// save it
+
+		// 5. Save manifest
 		err = saveManifest(state, &m)
 		if err != nil {
 			fmt.Println("error saving manifest:", err)
 			os.Exit(1)
 		}
 
-		// final output
-		fmt.Println("Building", name+":"+tagVal, "context:", context, "no-cache:", *noCache)
+		fmt.Println("Successfully built", name+":"+tagVal)
 
 
 	case "run":
