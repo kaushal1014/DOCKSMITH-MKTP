@@ -1,0 +1,193 @@
+package main
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+	"os"
+	"path/filepath"
+	"strings"
+	"crypto/sha256"
+	"encoding/hex"
+)
+
+type Config struct {
+	Env        []string `json:"Env"`
+	Cmd        []string `json:"Cmd"`
+	WorkingDir string   `json:"WorkingDir"`
+}
+
+type Layer struct {
+	Digest    string `json:"digest"`
+	Size      int64  `json:"size"`
+	CreatedBy string `json:"createdBy"`
+}
+
+type ImageManifest struct {
+	Name    string   `json:"name"`
+	Tag     string   `json:"tag"`
+	Digest  string   `json:"digest"`
+	Created string   `json:"created"`
+	Config  Config   `json:"config"`
+	Layers  []Layer  `json:"layers"`
+}
+
+
+func testManifest() {
+	m := ImageManifest{
+		Name:    "test",
+		Tag:     "latest",
+		Digest:  "",
+		Created: time.Now().Format(time.RFC3339),
+		Config: Config{
+			Env:        []string{"A=1"},
+			Cmd:        []string{"echo", "hello"},
+			WorkingDir: "/app",
+		},
+		Layers: []Layer{
+			{
+				Digest:    "sha256:abc",
+				Size:      1234,
+				CreatedBy: "COPY . /app",
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+
+	fmt.Println(string(data))
+}
+
+
+
+func saveManifest(state *State, m *ImageManifest) error {
+	filename := m.Name + "_" + m.Tag + ".json"
+	path := filepath.Join(state.Images, filename)
+
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0644)
+}
+
+func loadManifest(state *State, nameTag string) (*ImageManifest, error) {
+	filename := nameTag + ".json" // assume already "name_tag"
+	path := filepath.Join(state.Images, filename)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var m ImageManifest
+	err = json.Unmarshal(data, &m)
+	if err != nil {
+		return nil, err
+	}
+
+	return &m, nil
+}
+
+func listImages(state *State) error {
+	files, err := os.ReadDir(state.Images)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%-10s %-10s %-15s %-20s\n", "NAME", "TAG", "ID", "CREATED")
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		path := filepath.Join(state.Images, file.Name())
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		var m ImageManifest
+		if err := json.Unmarshal(data, &m); err != nil {
+			return err
+		}
+
+		id := m.Digest
+		if strings.HasPrefix(id, "sha256:") {
+			id = id[len("sha256:"):]
+		}
+		if len(id) > 12 {
+			id = id[:12]
+		}
+
+		fmt.Printf("%-10s %-10s %-15s %-20s\n",
+			m.Name,
+			m.Tag,
+			id,
+			m.Created,
+		)
+	}
+
+	return nil
+}
+
+func removeImage(state *State, nameTag string) error {
+	// convert name:tag → name_tag.json
+	parts := strings.Split(nameTag, ":")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid format, expected name:tag")
+	}
+
+	filename := parts[0] + "_" + parts[1] + ".json"
+	path := filepath.Join(state.Images, filename)
+
+	// check if file exists
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("image not found")
+	}
+
+	// load manifest
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var m ImageManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+
+	// delete layers
+	for _, layer := range m.Layers {
+		layerPath := filepath.Join(state.Layers, layer.Digest)
+		os.Remove(layerPath) // ignore error (spec allows broken refs)
+	}
+
+	// delete manifest
+	err = os.Remove(path)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func computeManifestDigest(m *ImageManifest) (string, error) {
+	// copy manifest
+	temp := *m
+	temp.Digest = ""
+
+	data, err := json.Marshal(temp)
+	if err != nil {
+		return "", err
+	}
+
+	hash := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(hash[:]), nil
+}
