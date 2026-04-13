@@ -1,0 +1,6 @@
+FROM busybox
+COPY . /app
+RUN echo hello
+WORKDIR /app
+ENV A=1
+CMD ["echo","hi"]

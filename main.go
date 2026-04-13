@@ -114,24 +114,59 @@ func main() {
 
 		fmt.Println("Successfully built", name+":"+tagVal)
 
-
 	case "run":
-		runCmd := flag.NewFlagSet("run", flag.ExitOnError)
-		var envs EnvList
-		runCmd.Var(&envs, "e", "env variables (KEY=VALUE)")
+			runCmd := flag.NewFlagSet("run", flag.ExitOnError)
+			var envs EnvList
+			runCmd.Var(&envs, "e", "env variables (KEY=VALUE)")
 
-		runCmd.Parse(os.Args[2:])
-		args := runCmd.Args()
+			runCmd.Parse(os.Args[2:])
+			args := runCmd.Args()
 
-		if len(args) < 1 {
-			fmt.Println("usage: docksmith run <name:tag> [cmd]")
-			os.Exit(1)
-		}
+			if len(args) < 1 {
+				fmt.Println("usage: docksmith run <name:tag> [cmd]")
+				os.Exit(1)
+			}
 
-		image := args[0]
-		cmd := args[1:]
+			image := args[0]
+			cmd := args[1:]
 
-		fmt.Println("RUN:", image, "cmd:", cmd, "env:", envs, "state:", state.Root)
+			fmt.Println("RUN:", image, "cmd:", cmd, "env:", envs)
+
+			// load manifest
+			parts := strings.Split(image, ":")
+			if len(parts) != 2 {
+				fmt.Println("invalid image format")
+				os.Exit(1)
+			}
+
+			filename := parts[0] + "_" + parts[1]
+			m, err := loadManifest(state, filename)
+			if err != nil {
+				fmt.Println("error loading image:", err)
+				os.Exit(1)
+			}
+
+			// create temp rootfs
+			tmpDir, err := os.MkdirTemp("", "docksmith-rootfs-*")
+			if err != nil {
+				fmt.Println("error creating temp dir:", err)
+				os.Exit(1)
+			}
+
+			fmt.Println("Temp rootfs:", tmpDir)
+
+			// extract layers
+			err = extractAllLayers(m.Layers, state, tmpDir)
+			if err != nil {
+				fmt.Println("error extracting layers:", err)
+				os.Exit(1)
+			}
+			
+			err = runCommandChroot(tmpDir, cmd)
+			if err != nil {
+				fmt.Println("error running command:", err)
+				os.Exit(1)
+			}
 
 	case "images":
 		err := listImages(state)

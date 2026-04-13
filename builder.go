@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 )
 
 type BuildState struct {
@@ -11,6 +12,7 @@ type BuildState struct {
 	Env        []string
 	Cmd        []string
 	WorkingDir string
+	RootFS string
 
 	Layers []Layer // empty for now
 }
@@ -25,7 +27,24 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			if len(inst.Args) != 1 {
 				return nil, fmt.Errorf("FROM requires exactly 1 argument")
 			}
-			buildState.BaseImage = inst.Args[0]
+
+			base := inst.Args[0]
+			buildState.BaseImage = base
+
+			rootfs, err := os.MkdirTemp("", "docksmith-build-*")
+			if err != nil {
+				return nil, err
+			}
+
+			buildState.RootFS = rootfs
+
+			err = loadBaseImage(base, state, rootfs)
+			if err != nil {
+				return nil, err
+			}
+
+			fmt.Println("Loaded base image:", base)
+			fmt.Println("RootFS:", rootfs)
 
 		case "WORKDIR":
 			if len(inst.Args) != 1 {
@@ -58,6 +77,14 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 				return nil, fmt.Errorf("only COPY . supported for now")
 			}
 
+			// 1. APPLY to rootfs 🔥
+			err := copyToRootFS(context, dest, buildState.RootFS)
+			if err != nil {
+				return nil, err
+			}
+			fmt.Println("Applying COPY to rootfs:", buildState.RootFS)
+
+			// 2. CREATE layer (existing logic)
 			layer, err := createCopyLayer(context, dest, state)
 			if err != nil {
 				return nil, err
@@ -66,7 +93,6 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			buildState.Layers = append(buildState.Layers, layer)
 
 			fmt.Println("Created COPY layer:", layer.Digest)
-
 		case "RUN":
 			fmt.Println("RUN step (not implemented yet)")
 		}
