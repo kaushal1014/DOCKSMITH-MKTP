@@ -13,9 +13,17 @@ type State struct {
 }
 
 func initState() (*State, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
+	user := os.Getenv("SUDO_USER")
+
+	var home string
+	if user != "" {
+		home = "/home/" + user
+	} else {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	root := filepath.Join(home, ".docksmith")
@@ -27,7 +35,7 @@ func initState() (*State, error) {
 		Cache:  filepath.Join(root, "cache"),
 	}
 
-	dirs := []string{state.Images, state.Layers, state.Cache}
+	dirs := []string{state.Images, state.Layers, state.Cache, filepath.Join(root, "base")}
 
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {

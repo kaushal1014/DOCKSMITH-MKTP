@@ -1,6 +1,7 @@
-FROM busybox
-COPY . /app
-RUN echo hello
+FROM alpine
 WORKDIR /app
-ENV A=1
-CMD ["echo","hi"]
+ENV NAME=World
+COPY hello.sh /app
+COPY config.txt /app
+RUN chmod +x /app/hello.sh
+CMD ["/bin/sh", "-c", "/app/hello.sh"]
