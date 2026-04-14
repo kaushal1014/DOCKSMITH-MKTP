@@ -1,13 +1,12 @@
 package main
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"time"
 	"os"
 	"path/filepath"
 	"strings"
-	"crypto/sha256"
-	"encoding/hex"
 )
 
 type Config struct {
@@ -29,37 +28,9 @@ type ImageManifest struct {
 	Created string   `json:"created"`
 	Config  Config   `json:"config"`
 	Layers  []Layer  `json:"layers"`
+	BaseImage string `json:"base_image"`
 }
 
-
-func testManifest() {
-	m := ImageManifest{
-		Name:    "test",
-		Tag:     "latest",
-		Digest:  "",
-		Created: time.Now().Format(time.RFC3339),
-		Config: Config{
-			Env:        []string{"A=1"},
-			Cmd:        []string{"echo", "hello"},
-			WorkingDir: "/app",
-		},
-		Layers: []Layer{
-			{
-				Digest:    "sha256:abc",
-				Size:      1234,
-				CreatedBy: "COPY . /app",
-			},
-		},
-	}
-
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		fmt.Println("error:", err)
-		return
-	}
-
-	fmt.Println(string(data))
-}
 
 
 
@@ -148,7 +119,7 @@ func removeImage(state *State, nameTag string) error {
 	path := filepath.Join(state.Images, filename)
 
 	// check if file exists
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
 		return fmt.Errorf("image not found")
 	}
 
