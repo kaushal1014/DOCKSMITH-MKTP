@@ -69,21 +69,20 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Store only the build-specific layers in the manifest.
-		// Base image content is reconstructed at runtime via loadBaseImage.
-		// BaseLayers are recorded separately for cache key chaining only.
+		allLayers := append([]Layer{}, buildState.BaseLayers...)
+		allLayers = append(allLayers, buildState.Layers...)
+
 		m := ImageManifest{
-			Name:      name,
-			Tag:       tagVal,
-			BaseImage: buildState.BaseImage,
-			Digest:    "",
-			Created:   created,
+			Name:    name,
+			Tag:     tagVal,
+			Digest:  "",
+			Created: created,
 			Config: Config{
 				Env:        buildState.Env,
 				Cmd:        buildState.Cmd,
 				WorkingDir: buildState.WorkingDir,
 			},
-			Layers: buildState.Layers,
+			Layers: allLayers,
 		}
 
 		digest, err := computeManifestDigest(&m)
@@ -134,7 +133,7 @@ func main() {
 		filename := parts[0] + "_" + parts[1]
 		m, err := loadManifest(state, filename)
 		if err != nil {
-			fmt.Println("error loading image:", err)
+			fmt.Println("error: image not found:", image)
 			os.Exit(1)
 		}
 
@@ -145,13 +144,8 @@ func main() {
 		}
 		defer os.RemoveAll(tmpDir)
 
-		// Assemble filesystem: base image then layers.
-		if err := loadBaseImage(m.BaseImage, state, tmpDir); err != nil {
-			fmt.Println("error loading base image:", err)
-			os.Exit(1)
-		}
 		if err := extractAllLayers(m.Layers, state, tmpDir); err != nil {
-			fmt.Println("error extracting layers:", err)
+			fmt.Println("error assembling image filesystem:", err)
 			os.Exit(1)
 		}
 
@@ -164,8 +158,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Merge env: image ENV first, then -e overrides.
-		finalEnv := append([]string{}, m.Config.Env...)
+		finalEnv := buildEnv(m.Config.Env)
 		for _, e := range envs {
 			key := strings.SplitN(e, "=", 2)[0]
 			var filtered []string
@@ -177,14 +170,12 @@ func main() {
 			finalEnv = append(filtered, e)
 		}
 
-		// quoteArg single-quotes a shell argument safely.
 		quoteArg := func(a string) string {
 			return "'" + strings.ReplaceAll(a, "'", "'\\''") + "'"
 		}
 
 		var runErr error
 		if len(cmd) > 0 {
-			// CLI override — quote each arg and wrap in shell string.
 			var quoted []string
 			for _, a := range cmd {
 				quoted = append(quoted, quoteArg(a))
@@ -192,7 +183,6 @@ func main() {
 			cmdStr := "cd " + workdir + " && exec " + strings.Join(quoted, " ")
 			runErr = runCommandChroot(tmpDir, []string{cmdStr}, finalEnv)
 		} else if len(m.Config.Cmd) > 0 {
-			// Exec form from image CMD — quote each arg and wrap in shell string.
 			var quoted []string
 			for _, a := range m.Config.Cmd {
 				quoted = append(quoted, quoteArg(a))
@@ -200,7 +190,7 @@ func main() {
 			cmdStr := "cd " + workdir + " && exec " + strings.Join(quoted, " ")
 			runErr = runCommandChroot(tmpDir, []string{cmdStr}, finalEnv)
 		} else {
-			fmt.Println("error: no command specified and no CMD in image")
+			fmt.Println("error: no command specified and no CMD defined in the image")
 			os.Exit(1)
 		}
 

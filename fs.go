@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/tar"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -31,7 +33,6 @@ func extractLayer(layerPath string, target string) error {
 		cleanName := strings.TrimPrefix(header.Name, "/")
 		destPath := filepath.Join(target, cleanName)
 
-		// ensure parent dirs exist
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 			return err
 		}
@@ -53,19 +54,14 @@ func extractLayer(layerPath string, target string) error {
 			if err != nil {
 				return err
 			}
-			// DEBUG
-			fmt.Printf("  [extract] %s mode=%o\n", header.Name, header.Mode)
 			if err := os.Chmod(destPath, os.FileMode(header.Mode)); err != nil {
 				return err
 			}
+
 		case tar.TypeSymlink:
 			linkTarget := header.Linkname
-
-			// remove existing file if any
 			os.Remove(destPath)
-
-			err := os.Symlink(linkTarget, destPath)
-			if err != nil {
+			if err := os.Symlink(linkTarget, destPath); err != nil {
 				return err
 			}
 		}
@@ -78,75 +74,54 @@ func extractAllLayers(layers []Layer, state *State, target string) error {
 	for _, layer := range layers {
 		layerPath := filepath.Join(state.Layers, layer.Digest)
 
-		err := extractLayer(layerPath, target)
-		if err != nil {
+		if _, err := os.Lstat(layerPath); os.IsNotExist(err) {
+			return fmt.Errorf("layer file missing for digest %s — image may be broken (run 'docksmith rmi' and rebuild)", layer.Digest)
+		}
+
+		if err := extractLayer(layerPath, target); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func loadBaseImage(base string, state *State, target string) error {
-	// Sanitize the base image name for use as a filename (replace ':' with '_').
+func loadBaseImage(base string, state *State, target string) (string, error) {
 	safeName := strings.ReplaceAll(base, ":", "_")
 	path := filepath.Join(state.Root, "base", safeName+".tar")
 
-	// check exists
 	if _, err := os.Lstat(path); os.IsNotExist(err) {
-		return fmt.Errorf("base image not found: %s (looked for %s)", base, path)
+		return "", fmt.Errorf("base image not found: %s (looked for %s) — import the base image before building", base, path)
 	}
 
-	return extractLayer(path, target)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading base image tar %s: %w", path, err)
+	}
+
+	hash := sha256.Sum256(data)
+	digest := "sha256:" + hex.EncodeToString(hash[:])
+
+	layerPath := filepath.Join(state.Layers, digest)
+	if _, err := os.Lstat(layerPath); os.IsNotExist(err) {
+		// Not yet in the layer store — write it.
+		if err := os.WriteFile(layerPath, data, 0644); err != nil {
+			return "", fmt.Errorf("writing base layer to store: %w", err)
+		}
+	}
+
+	// Extract into the build rootfs.
+	if err := extractLayer(path, target); err != nil {
+		return "", fmt.Errorf("extracting base image %s: %w", base, err)
+	}
+
+	return digest, nil
 }
 
-func copyToRootFS(contextDir string, dest string, rootfs string) error {
-	return filepath.Walk(contextDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		rel, err := filepath.Rel(contextDir, path)
-		if err != nil {
-			return err
-		}
-		cleanDest := strings.TrimPrefix(dest, "/")
-		targetPath := filepath.Join(rootfs, cleanDest, rel)
-
-
-		if info.IsDir() {
-			return os.MkdirAll(targetPath, 0755)
-		}
-
-		// ensure parent dir exists
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-			return err
-		}
-
-		srcFile, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer srcFile.Close()
-
-		dstFile, err := os.Create(targetPath)
-		if err != nil {
-			return err
-		}
-		_, err = io.Copy(dstFile, srcFile)
-		dstFile.Close()
-		return err
-	})
-}
-
-// resolveGlob expands a src pattern (relative to contextDir) into a sorted
-// list of matching absolute paths. Supports * and ** globs.
-// Special case: "." returns []string{contextDir}.
 func resolveGlob(contextDir string, pattern string) ([]string, error) {
 	if pattern == "." {
 		return []string{contextDir}, nil
 	}
 
-	// If no glob chars, treat as literal path.
 	if !strings.ContainsAny(pattern, "*?[") {
 		full := filepath.Join(contextDir, pattern)
 		if _, err := os.Lstat(full); err != nil {
@@ -155,7 +130,6 @@ func resolveGlob(contextDir string, pattern string) ([]string, error) {
 		return []string{full}, nil
 	}
 
-	// ** glob: walk entire tree and match each relative path.
 	if strings.Contains(pattern, "**") {
 		var matches []string
 		err := filepath.Walk(contextDir, func(path string, info os.FileInfo, err error) error {
@@ -182,7 +156,6 @@ func resolveGlob(contextDir string, pattern string) ([]string, error) {
 		return matches, err
 	}
 
-	// Regular glob (supports *  and ?).
 	globPattern := filepath.Join(contextDir, pattern)
 	matches, err := filepath.Glob(globPattern)
 	if err != nil {
@@ -195,10 +168,7 @@ func resolveGlob(contextDir string, pattern string) ([]string, error) {
 	return matches, nil
 }
 
-// matchDoubleGlob matches a relative path against a pattern that may contain **.
-// ** matches any number of path segments (including zero).
 func matchDoubleGlob(pattern, rel string) (bool, error) {
-	// Split both into segments.
 	patParts := strings.Split(filepath.ToSlash(pattern), "/")
 	relParts := strings.Split(filepath.ToSlash(rel), "/")
 	return matchSegments(patParts, relParts)
@@ -212,7 +182,6 @@ func matchSegments(pat, rel []string) (bool, error) {
 		return false, nil
 	}
 	if pat[0] == "**" {
-		// ** can consume zero or more segments.
 		for i := 0; i <= len(rel); i++ {
 			ok, err := matchSegments(pat[1:], rel[i:])
 			if err != nil {
@@ -234,8 +203,7 @@ func matchSegments(pat, rel []string) (bool, error) {
 	return matchSegments(pat[1:], rel[1:])
 }
 
-// copyGlobToRootFS copies all files matched by srcs into dest inside rootfs.
-// Each src is an absolute path; if it is a directory its contents are walked.
+
 func copyGlobToRootFS(srcs []string, contextDir string, dest string, rootfs string) error {
 	cleanDest := strings.TrimPrefix(dest, "/")
 	for _, src := range srcs {
@@ -244,7 +212,6 @@ func copyGlobToRootFS(srcs []string, contextDir string, dest string, rootfs stri
 			return err
 		}
 		if info.IsDir() {
-			// Walk the directory, preserving relative structure under dest.
 			err = filepath.Walk(src, func(path string, fi os.FileInfo, err error) error {
 				if err != nil {
 					return err
@@ -266,10 +233,8 @@ func copyGlobToRootFS(srcs []string, contextDir string, dest string, rootfs stri
 				return err
 			}
 		} else {
-			// Single file: place directly under dest.
 			rel, err := filepath.Rel(contextDir, src)
 			if err != nil {
-				// src is not under contextDir — use basename.
 				rel = filepath.Base(src)
 			}
 			targetPath := filepath.Join(rootfs, cleanDest, rel)
@@ -294,7 +259,6 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer srcFile.Close()
-	// Use source file's permission bits so execute bits are preserved.
 	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode().Perm())
 	if err != nil {
 		return err
@@ -304,6 +268,5 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	// Explicit chmod overrides any umask applied by OpenFile.
 	return os.Chmod(dst, srcInfo.Mode().Perm())
 }

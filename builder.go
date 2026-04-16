@@ -21,13 +21,33 @@ type BuildState struct {
 	WorkingDir string
 
 	Layers     []Layer
-	BaseLayers []Layer // layers inherited from the base image
+	BaseLayers []Layer 
 }
 
 type BuildOptions struct {
 	NoCache bool
 	Name    string
 	Tag     string
+}
+
+func buildEnv(imageEnv []string) []string {
+	defaults := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/root",
+		"TERM=xterm",
+	}
+	result := append([]string{}, defaults...)
+	for _, kv := range imageEnv {
+		key := strings.SplitN(kv, "=", 2)[0]
+		filtered := result[:0]
+		for _, existing := range result {
+			if !strings.HasPrefix(existing, key+"=") {
+				filtered = append(filtered, existing)
+			}
+		}
+		result = append(filtered, kv)
+	}
+	return result
 }
 
 func executeInstructions(instructions []Instruction, context string, state *State, opts BuildOptions) (*BuildState, string, error) {
@@ -40,13 +60,11 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 
 	prevDigest := ""
 	cacheBroken := false
-	allCacheHits := true
 
 	totalSteps := len(instructions)
 	stepNum := 0
 	totalStart := time.Now()
 
-	// Harvest existing created timestamp for cache-hit rebuilds.
 	originalCreated := ""
 	if existing, _ := loadManifest(state, opts.Name+"_"+opts.Tag); existing != nil {
 		originalCreated = existing.Created
@@ -56,8 +74,6 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 		stepNum++
 
 		switch inst.Type {
-
-		// ------------------------------------------------------------------ FROM
 		case "FROM":
 			if len(inst.Args) != 1 {
 				return nil, "", fmt.Errorf("FROM requires exactly 1 argument")
@@ -73,22 +89,27 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			}
 			buildState.RootFS = rootfs
 
-			if err := loadBaseImage(base, state, rootfs); err != nil {
+			baseLayerDigest, err := loadBaseImage(base, state, rootfs)
+			if err != nil {
 				return nil, "", err
 			}
 
-			// Try to load a Docksmith manifest for the base image so we can
-			// include its layers and use its digest as the first prevDigest.
 			if baseManifest, err := loadBaseManifestByName(base, state); err == nil {
 				buildState.BaseLayers = baseManifest.Layers
 				prevDigest = baseManifest.Digest
 			} else {
-				// Plain imported tarball — derive digest from the tar bytes.
-				prevDigest = digestBaseImageTar(base, state)
+				info, _ := os.Stat(filepath.Join(state.Layers, baseLayerDigest))
+				var size int64
+				if info != nil {
+					size = info.Size()
+				}
+				buildState.BaseLayers = []Layer{
+					{Digest: baseLayerDigest, Size: size, CreatedBy: "FROM " + base},
+				}
+				prevDigest = baseLayerDigest
 			}
 			buildState.BaseManifestDigest = prevDigest
 
-		// ---------------------------------------------------------------- WORKDIR
 		case "WORKDIR":
 			if len(inst.Args) != 1 {
 				return nil, "", fmt.Errorf("WORKDIR requires exactly 1 argument")
@@ -96,7 +117,6 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			buildState.WorkingDir = inst.Args[0]
 			fmt.Printf("Step %d/%d : WORKDIR %s\n", stepNum, totalSteps, inst.Args[0])
 
-		// ------------------------------------------------------------------- ENV
 		case "ENV":
 			if len(inst.Args) != 1 {
 				return nil, "", fmt.Errorf("ENV requires KEY=VALUE")
@@ -104,7 +124,6 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			buildState.Env = append(buildState.Env, inst.Args[0])
 			fmt.Printf("Step %d/%d : ENV %s\n", stepNum, totalSteps, inst.Args[0])
 
-		// ------------------------------------------------------------------- CMD
 		case "CMD":
 			cmd, err := parseCMD(inst.Args)
 			if err != nil {
@@ -113,7 +132,6 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			buildState.Cmd = cmd
 			fmt.Printf("Step %d/%d : CMD %s\n", stepNum, totalSteps, inst.Args[0])
 
-		// ------------------------------------------------------------------ COPY
 		case "COPY":
 			if len(inst.Args) != 2 {
 				return nil, "", fmt.Errorf("COPY requires src and dest")
@@ -121,30 +139,46 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			src := inst.Args[0]
 			dest := inst.Args[1]
 
-			// Ensure WORKDIR exists before copying into the rootfs.
 			if buildState.WorkingDir != "" {
 				if err := os.MkdirAll(filepath.Join(buildState.RootFS, buildState.WorkingDir), 0755); err != nil {
 					return nil, "", err
 				}
 			}
 
-			// Resolve glob pattern to a list of absolute source paths.
 			srcs, err := resolveGlob(context, src)
 			if err != nil {
 				return nil, "", err
 			}
 
-			// Compute source file hashes for the cache key (COPY-specific).
-			// Hash all files across all matched srcs, keyed by path relative to context.
 			srcHashes := make(map[string]string)
 			for _, s := range srcs {
-				h, err := hashContextFiles(s)
+				info, err := os.Lstat(s)
 				if err != nil {
 					return nil, "", err
 				}
-				for k, v := range h {
-					rel, _ := filepath.Rel(context, filepath.Join(s, k))
-					srcHashes[rel] = v
+				if info.IsDir() {
+					h, err := hashContextFiles(s)
+					if err != nil {
+						return nil, "", err
+					}
+					for relInDir, digest := range h {
+						absPath := filepath.Join(s, relInDir)
+						relToCtx, err := filepath.Rel(context, absPath)
+						if err != nil {
+							return nil, "", err
+						}
+						srcHashes[relToCtx] = digest
+					}
+				} else {
+					relToCtx, err := filepath.Rel(context, s)
+					if err != nil {
+						return nil, "", err
+					}
+					h, err := hashFile(s)
+					if err != nil {
+						return nil, "", err
+					}
+					srcHashes[relToCtx] = h
 				}
 			}
 
@@ -169,9 +203,7 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 				}
 			}
 
-			// Cache miss.
 			cacheBroken = true
-			allCacheHits = false
 
 			if err := copyGlobToRootFS(srcs, context, dest, buildState.RootFS); err != nil {
 				return nil, "", err
@@ -192,11 +224,9 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			buildState.Layers = append(buildState.Layers, layer)
 			prevDigest = layer.Digest
 
-		// ------------------------------------------------------------------- RUN
 		case "RUN":
 			cmdStr := strings.Join(inst.Args, " ")
 
-			// Ensure WORKDIR exists before running.
 			if buildState.WorkingDir != "" {
 				if err := os.MkdirAll(filepath.Join(buildState.RootFS, buildState.WorkingDir), 0755); err != nil {
 					return nil, "", err
@@ -224,9 +254,7 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 				}
 			}
 
-			// Cache miss — execute inside the rootfs.
 			cacheBroken = true
-			allCacheHits = false
 
 			before, err := snapshotFS(buildState.RootFS)
 			if err != nil {
@@ -238,8 +266,9 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 				runCmd = "cd " + buildState.WorkingDir + " && " + cmdStr
 			}
 
-			fmt.Printf("Step %d/%d : RUN %s\n", stepNum, totalSteps, cmdStr)
-			if err := runCommandChroot(buildState.RootFS, []string{runCmd}, buildState.Env); err != nil {
+			runEnv := buildEnv(buildState.Env)
+
+			if err := runCommandChroot(buildState.RootFS, []string{runCmd}, runEnv); err != nil {
 				return nil, "", err
 			}
 
@@ -255,7 +284,7 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 			}
 
 			elapsed := time.Since(stepStart)
-			fmt.Printf(" ---> [CACHE MISS] %.2fs\n", elapsed.Seconds())
+			fmt.Printf("Step %d/%d : RUN %s [CACHE MISS] %.2fs\n", stepNum, totalSteps, cmdStr, elapsed.Seconds())
 
 			if !opts.NoCache {
 				if err := storeCache(state, cacheIdx, cacheKey, layer.Digest); err != nil {
@@ -267,10 +296,9 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 		}
 	}
 
-	// Determine created timestamp: preserve original if all steps were cache hits.
-	created := time.Now().Format(time.RFC3339)
-	if allCacheHits && originalCreated != "" {
-		created = originalCreated
+	created := originalCreated
+	if created == "" {
+		created = time.Unix(0, 0).Format(time.RFC3339)
 	}
 
 	totalElapsed := time.Since(totalStart)
@@ -279,7 +307,6 @@ func executeInstructions(instructions []Instruction, context string, state *Stat
 	return buildState, created, nil
 }
 
-// loadBaseManifestByName loads the Docksmith manifest for a base image.
 func loadBaseManifestByName(base string, state *State) (*ImageManifest, error) {
 	nameTag := strings.ReplaceAll(base, ":", "_")
 	if !strings.Contains(base, ":") {
@@ -288,19 +315,6 @@ func loadBaseManifestByName(base string, state *State) (*ImageManifest, error) {
 	return loadManifest(state, nameTag)
 }
 
-// digestBaseImageTar returns a sha256 hex digest of the raw base tarball.
-// Used when the base image has no Docksmith manifest (plain imported tar).
-func digestBaseImageTar(base string, state *State) string {
-	safeName := strings.ReplaceAll(base, ":", "_")
-	path := filepath.Join(state.Root, "base", safeName+".tar")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "unknown:" + base
-	}
-	return hashBytes(data)
-}
-
-// hashBytes returns "sha256:<hex>" for the given data.
 func hashBytes(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
@@ -312,7 +326,7 @@ func parseCMD(args []string) ([]string, error) {
 	}
 	var cmd []string
 	if err := json.Unmarshal([]byte(args[0]), &cmd); err != nil {
-		return nil, fmt.Errorf("invalid CMD format, must be JSON array")
+		return nil, fmt.Errorf("invalid CMD format, must be JSON array: %w", err)
 	}
 	return cmd, nil
 }

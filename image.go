@@ -1,4 +1,5 @@
 package main
+
 import (
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,32 +23,34 @@ type Layer struct {
 }
 
 type ImageManifest struct {
-	Name    string   `json:"name"`
-	Tag     string   `json:"tag"`
-	Digest  string   `json:"digest"`
-	Created string   `json:"created"`
-	Config  Config   `json:"config"`
-	Layers  []Layer  `json:"layers"`
-	BaseImage string `json:"base_image"`
+	Name    string  `json:"name"`
+	Tag     string  `json:"tag"`
+	Digest  string  `json:"digest"`
+	Created string  `json:"created"`
+	Config  Config  `json:"config"`
+	Layers  []Layer `json:"layers"`
 }
 
-
-
-
 func saveManifest(state *State, m *ImageManifest) error {
-	filename := m.Name + "_" + m.Tag + ".json"
-	path := filepath.Join(state.Images, filename)
+    digest, err := computeManifestDigest(m)
+    if err != nil {
+        return err
+    }
+    m.Digest = digest 
 
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
+    filename := m.Name + "_" + m.Tag + ".json"
+    path := filepath.Join(state.Images, filename)
 
-	return os.WriteFile(path, data, 0644)
+    data, err := json.MarshalIndent(m, "", "  ")
+    if err != nil {
+        return err
+    }
+
+    return os.WriteFile(path, data, 0644)
 }
 
 func loadManifest(state *State, nameTag string) (*ImageManifest, error) {
-	filename := nameTag + ".json" // assume already "name_tag"
+	filename := nameTag + ".json"
 	path := filepath.Join(state.Images, filename)
 
 	data, err := os.ReadFile(path)
@@ -70,7 +73,7 @@ func listImages(state *State) error {
 		return err
 	}
 
-	fmt.Printf("%-10s %-10s %-15s %-20s\n", "NAME", "TAG", "ID", "CREATED")
+	fmt.Printf("%-20s %-10s %-15s %-25s\n", "NAME", "TAG", "ID", "CREATED")
 
 	for _, file := range files {
 		if file.IsDir() {
@@ -86,7 +89,7 @@ func listImages(state *State) error {
 
 		var m ImageManifest
 		if err := json.Unmarshal(data, &m); err != nil {
-			return err
+			continue
 		}
 
 		id := m.Digest
@@ -97,7 +100,7 @@ func listImages(state *State) error {
 			id = id[:12]
 		}
 
-		fmt.Printf("%-10s %-10s %-15s %-20s\n",
+		fmt.Printf("%-20s %-10s %-15s %-25s\n",
 			m.Name,
 			m.Tag,
 			id,
@@ -109,7 +112,6 @@ func listImages(state *State) error {
 }
 
 func removeImage(state *State, nameTag string) error {
-	// convert name:tag → name_tag.json
 	parts := strings.Split(nameTag, ":")
 	if len(parts) != 2 {
 		return fmt.Errorf("invalid format, expected name:tag")
@@ -118,12 +120,10 @@ func removeImage(state *State, nameTag string) error {
 	filename := parts[0] + "_" + parts[1] + ".json"
 	path := filepath.Join(state.Images, filename)
 
-	// check if file exists
 	if _, err := os.Lstat(path); os.IsNotExist(err) {
-		return fmt.Errorf("image not found")
+		return fmt.Errorf("image not found: %s", nameTag)
 	}
 
-	// load manifest
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -134,23 +134,15 @@ func removeImage(state *State, nameTag string) error {
 		return err
 	}
 
-	// delete layers
 	for _, layer := range m.Layers {
 		layerPath := filepath.Join(state.Layers, layer.Digest)
-		os.Remove(layerPath) // ignore error (spec allows broken refs)
+		os.Remove(layerPath)
 	}
 
-	// delete manifest
-	err = os.Remove(path)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return os.Remove(path)
 }
 
 func computeManifestDigest(m *ImageManifest) (string, error) {
-	// copy manifest
 	temp := *m
 	temp.Digest = ""
 
